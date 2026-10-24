@@ -34,3 +34,5 @@ htmlcov/
 .coverage
 
 .env
+
+.env
