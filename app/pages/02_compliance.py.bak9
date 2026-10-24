@@ -1,0 +1,76 @@
+"""Compliance Research — retrieves and cites statutes. Never renders model output as HTML."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import streamlit as st  # noqa: E402
+from components import shared  # noqa: E402
+
+shared.setup("Compliance Research")
+jurisdiction = shared.sidebar()
+
+st.title("⚖ Compliance Research")
+st.caption("Retrieves and cites statutes. All outputs are pending human review. This is not legal advice.")
+st.info(f"Active jurisdiction: {shared.FLAGS[jurisdiction]} **{jurisdiction}** — change it in the sidebar.")
+
+query = st.text_area("Research query", height=100, max_chars=2000,
+                     placeholder="e.g. What are the data processor obligations under GDPR Article 28?")
+matter_ref = st.text_input("Matter reference (optional)", placeholder="KEJ-1A2B3C4D", max_chars=64)
+doc = shared.document_panel("compliance")
+
+if st.button("Search statutes →", type="primary"):
+    q = query.strip() or ("Identify the statutory provisions most relevant to this document." if doc else "")
+    if len(q) < 3:
+        st.warning("Please enter a research query or attach a document.")
+    else:
+        with st.spinner("Retrieving statutes…"):
+            data, err = shared.api_call("POST", "/compliance/check", json={
+                "query": q, "jurisdiction": jurisdiction,
+                "matter_ref": matter_ref.strip() or "KEJI-DRAFT",
+                **({"document_text": doc["text"], "document_name": doc["name"]} if doc else {})})
+            hint, _ = shared.api_call("POST", "/jurisdiction/classify", json={"text": q}, timeout=20) if not err else (None, None)
+        st.session_state["compliance_result"] = {"data": data, "err": err, "hint": hint, "jx": jurisdiction}
+
+res = st.session_state.get("compliance_result")
+if res:
+    if res["err"]:
+        st.error(res["err"])
+    else:
+        data, hint = res["data"], res["hint"]
+        # The router only SUGGESTS. We never switch jurisdiction on the user's behalf.
+        sug = (hint or {}).get("suggestion")
+        if sug in shared.FLAGS and sug != res["jx"]:
+            st.info(f"This question looks like it concerns **{sug}**, but you searched **{res['jx']}**. "
+                    "If that was a mistake, change the jurisdiction in the sidebar and search again.")
+
+        status = data.get("status")
+        if status == "SUCCESS":
+            st.success(f"Research complete · Check ID: `{data.get('check_id')}` · Status: pending review")
+        elif status == "NO_VALID_CITATIONS":
+            st.warning("The assistant's answer had no verifiable citation, so it was withheld. "
+                       "The retrieved provisions below are still available to a human reviewer.")
+        else:
+            st.info("No applicable provision was retrieved for this query.")
+
+        st.markdown("### Result (pending human review)")
+        import html as _html  # the text is escaped first, so model output can never inject markup
+        _out = _html.escape(data.get("validated_output") or "No output.").replace("\n", "<br>")
+        st.markdown(f'<div class="keji-result">{_out}</div>', unsafe_allow_html=True)
+
+        if data.get("hallucinated_ids"):
+            st.warning(f"⚠ {len(data['hallucinated_ids'])} citation(s) removed — not present in the retrieved context.")
+        if data.get("unverified_quotes"):
+            st.warning(f"⚠ {len(data['unverified_quotes'])} quotation(s) could not be found word-for-word in the "
+                       "cited provision. Verify against the statute before relying on them.")
+
+        cites = data.get("citations", [])
+        if cites:
+            st.markdown(f"**{len(cites)} provision(s) retrieved**")
+            for c in cites:
+                with st.expander(f"Rank {c.get('rrf_rank', '?')} — {c.get('statute_name', '?')} "
+                                 f"[{c.get('section', '')}] · {c.get('jurisdiction', '?')}"):
+                    st.caption(f"ID {str(c.get('id', ''))[:8]}")
+                    st.text(c.get("content", "")[:1500])
+        st.divider()
+        st.caption(shared.DISCLAIMER)

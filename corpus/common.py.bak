@@ -1,0 +1,119 @@
+"""Shared helpers for every ingestion script."""
+import sys
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+import httpx
+import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from api.rag import embedder  # noqa: E402
+
+USER_AGENT = "KEJI Legal Research/0.1 (contact@keji.legal)"
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def http_get(url: str, *, retries: int = 3, timeout: int = 60, **kw) -> requests.Response:
+    """GET with retry + backoff. Raises on final failure."""
+    headers = {"User-Agent": USER_AGENT, **kw.pop("headers", {})}
+    last: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout, **kw)
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"{r.status_code} from {url}")
+            return r
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"GET failed after {retries} tries: {url} ({last})")
+
+
+def with_retry(fn, attempts=6, base_delay=3.0):
+    """Run fn(); on a NETWORK error wait and try again (3s, 6s, 9s...). Other errors are raised at once."""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except (httpx.TransportError, OSError) as e:
+            last = e
+            if i == attempts - 1:
+                break
+            wait = base_delay * (i + 1)
+            print(f"    !! network problem ({type(e).__name__}); retrying in {wait:.0f}s [{i + 1}/{attempts - 1}]", flush=True)
+            time.sleep(wait)
+    raise RuntimeError(
+        f"Network kept failing after {attempts} tries ({type(last).__name__}). Check your internet/VPN, "
+        "then simply re-run the same command - chunks already stored are skipped automatically."
+    ) from last
+
+
+def sanity_check(text: str, marker: str, name: str, min_chars: int = 2000) -> bool:
+    """
+    Verify a download is really the document before storing it.
+    Catches bot-challenge pages, empty files and wrong URLs (guide fix 2).
+    """
+    if len(text) < min_chars:
+        print(f"  ⛔ SANITY FAIL: {name} is only {len(text)} chars (expected ≥ {min_chars}) — "
+              f"likely an error/challenge page. First 200: {text[:200]!r}")
+        return False
+    if marker.lower() not in text.lower():
+        print(f"  ⛔ SANITY FAIL: '{marker}' not found in {name}. SKIPPING — check the source URL.")
+        return False
+    return True
+
+
+def store_chunks(chunks: list[dict], *, embed: Optional[Callable] = None, db=None, batch: int = 64) -> tuple[int, int]:
+    """
+    Embed + upsert chunks batch by batch (a crash loses at most one batch; re-running is safe).
+    Duplicates are skipped by the (jurisdiction, content_hash) unique index.
+    Returns (inserted, skipped_duplicates).
+    """
+    if not chunks:
+        return 0, 0
+    if db is None:
+        from api.rag.retriever import get_supabase
+        db = get_supabase()
+    embed = embed or (lambda texts: embedder.embed_documents(texts, show_progress=False))
+
+    inserted = 0
+    for i in range(0, len(chunks), batch):
+        part = chunks[i : i + batch]
+        vectors = embed([c["content"] for c in part])
+        rows = [
+            {
+                "jurisdiction": c["jurisdiction"], "corpus_type": c["corpus_type"],
+                "statute_name": c["statute_name"], "section": c["section"], "year": c["year"],
+                "content": c["content"], "embedding": v.tolist(), "metadata": c["metadata"],
+            }
+            for c, v in zip(part, vectors)
+        ]
+        res = db.table("statute_chunks").upsert(
+            rows, on_conflict="jurisdiction,content_hash", ignore_duplicates=True
+        ).execute()
+        inserted += len(res.data or [])
+        print(f"    batch {i // batch + 1}: {min(i + batch, len(chunks))}/{len(chunks)}", flush=True)
+    return inserted, len(chunks) - inserted
+
+
+def save_and_load(url: str, path: Path, **kw) -> Optional[bytes]:
+    """
+    Download `url` to `path`. If the download fails but you already saved the
+    file by hand (e.g. from your browser), use that instead.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        print(f"  Downloading: {url}")
+        r = http_get(url, **kw)
+        r.raise_for_status()
+        path.write_bytes(r.content)
+        return r.content
+    except Exception as e:  # noqa: BLE001
+        if path.exists() and path.stat().st_size > 0:
+            print(f"  ⚠ Download failed ({e}); using the local file {path}")
+            return path.read_bytes()
+        print(f"  ⚠ Download failed: {e}")
+        print(f"    Tip: open the URL in your browser, save the file as {path}, and re-run.")
+        return None

@@ -1,0 +1,97 @@
+"""Compliance research + human-in-the-loop review endpoints."""
+import re
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from api.agents.routing_agent import classify
+from api.auth import verify_reviewer, verify_token
+from api.deps import get_agent, get_db
+from api.schemas import ClassifyRequest, ComplianceRequest, ReviewRequest
+
+router = APIRouter(tags=["Compliance"], dependencies=[Depends(verify_token)])
+UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _check_id(check_id: str) -> str:
+    if not UUID_RE.match(check_id):
+        raise HTTPException(400, "check_id must be a UUID")
+    return check_id
+
+
+@router.post("/jurisdiction/classify")
+def classify_jurisdiction(body: ClassifyRequest):
+    """A suggestion only — the user's own jurisdiction choice always wins."""
+    return classify(body.text)
+
+
+@router.post("/compliance/check")
+def compliance_check(body: ComplianceRequest, agent=Depends(get_agent), db=Depends(get_db)):
+    try:
+        result = agent.run(query=body.query, jurisdiction=body.jurisdiction, matter_ref=body.matter_ref)
+    except RuntimeError as e:  # retrieval outage / missing config
+        raise HTTPException(503, f"Research service unavailable: {e}")
+
+    matter_id = None
+    if body.matter_ref != "KEJI-DRAFT":
+        m = db.table("matters").select("id").eq("matter_ref", body.matter_ref).execute()
+        matter_id = m.data[0]["id"] if m.data else None
+
+    row = {
+        "matter_id": matter_id,
+        "check_type": "compliance",
+        "jurisdiction": body.jurisdiction,
+        "query": body.query,
+        "citations": result["citations"],
+        "raw_output": result["raw_output"],
+        "validated_output": result["validated_output"],
+        "status": "pending_review",  # nothing is final until a human approves it
+        "agent_log": result["log"],
+    }
+    saved = db.table("compliance_checks").insert(row).execute()
+    check_id = saved.data[0]["id"] if saved.data else None
+    return {**result, "check_id": check_id}
+
+
+@router.get("/compliance/{check_id}/status")
+def check_status(check_id: str, db=Depends(get_db)):
+    """Public-to-API-token status poll: exposes status only, never content."""
+    r = db.table("compliance_checks").select("id,status,reviewed_at").eq("id", _check_id(check_id)).execute()
+    if not r.data:
+        raise HTTPException(404, "Check not found")
+    return r.data[0]
+
+
+# ── reviewer-only endpoints (need X-Reviewer-Key as well) ───────────────────
+@router.get("/review/pending", dependencies=[Depends(verify_reviewer)])
+def list_pending(db=Depends(get_db), limit: int = 50):
+    limit = max(1, min(limit, 200))
+    r = (db.table("compliance_checks").select("*").eq("status", "pending_review")
+         .order("created_at", desc=True).limit(limit).execute())
+    return {"count": len(r.data or []), "items": r.data or []}
+
+
+def _review(db, check_id: str, new_status: str, body: ReviewRequest):
+    update = {"status": new_status, "reviewed_at": _now(), "reviewer_note": body.reviewer_note}
+    if body.validated_output is not None:
+        update["validated_output"] = body.validated_output
+    # Only a pending check can be reviewed — makes double-approval impossible.
+    r = (db.table("compliance_checks").update(update)
+         .eq("id", _check_id(check_id)).eq("status", "pending_review").execute())
+    if not r.data:
+        raise HTTPException(409, "Check not found or already reviewed")
+    return {"status": new_status, "check_id": check_id}
+
+
+@router.put("/compliance/{check_id}/approve", dependencies=[Depends(verify_reviewer)])
+def approve(check_id: str, body: ReviewRequest, db=Depends(get_db)):
+    return _review(db, check_id, "approved", body)
+
+
+@router.put("/compliance/{check_id}/reject", dependencies=[Depends(verify_reviewer)])
+def reject(check_id: str, body: ReviewRequest, db=Depends(get_db)):
+    return _review(db, check_id, "rejected", body)

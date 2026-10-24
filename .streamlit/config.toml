@@ -1,0 +1,14 @@
+# High-contrast light theme (the page CSS in app/components/shared.py also forces these colours).
+[theme]
+base = "light"
+primaryColor = "#1A1A1A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#EFE8D4"
+textColor = "#000000"
+font = "sans serif"
+
+[server]
+maxUploadSize = 10
+
+[browser]
+gatherUsageStats = false

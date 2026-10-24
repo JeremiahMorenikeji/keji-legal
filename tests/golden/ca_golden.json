@@ -1,0 +1,12 @@
+{
+  "version": "1.0",
+  "jurisdiction": "CA",
+  "queries": [
+    {"id": "CA-001", "query": "What is the duty of care of directors under Canadian corporate law?",
+     "expected_statute": "Canada Business Corporations Act", "expected_section_keyword": "director",
+     "ground_truth": "Every director and officer of a corporation shall act honestly and in good faith with a view to the best interests of the corporation."},
+    {"id": "CA-002", "query": "When is consent required to collect personal information?",
+     "expected_statute": "Personal Information Protection and Electronic Documents Act", "expected_section_keyword": "consent",
+     "ground_truth": "Consent of the individual is required for the collection, use or disclosure of personal information."}
+  ]
+}

@@ -1,0 +1,182 @@
+import pytest
+from fastapi.testclient import TestClient
+
+from api import auth, deps
+from api.agents.compliance_agent import ComplianceAgent
+from api.main import app
+from tests.conftest import FakeLLM, make_chunk
+
+C1 = dict(make_chunk(0xAAAAAAAA), rrf_rank=1)
+GOOD = '• [CHUNK-ID: aaaaaaaa] Companies Act 2006, Section 172\n  "promote the success of the company"'
+
+
+@pytest.fixture
+def client(fake_db, monkeypatch):
+    agent = ComplianceAgent(llm=FakeLLM(GOOD), retrieve=lambda q, jx: [dict(C1)])
+    app.dependency_overrides[deps.get_db] = lambda: fake_db
+    app.dependency_overrides[deps.get_agent] = lambda: agent
+    from api.rag import retriever
+    monkeypatch.setattr(retriever, "retrieve", lambda q, jx: [dict(C1)])
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def test_health_needs_no_auth_or_db():
+    r = TestClient(app).get("/health")
+    assert r.status_code == 200 and r.json()["status"] == "ok" and r.json()["version"] == "0.1.0"
+
+
+def test_classify(client):
+    r = client.post("/jurisdiction/classify", json={"text": "GDPR breach notification"})
+    assert r.status_code == 200 and r.json()["suggestion"] == "EU"
+
+
+def test_check_is_stored_pending_review(client, fake_db):
+    r = client.post("/compliance/check", json={"query": "director duties", "jurisdiction": "UK"})
+    body = r.json()
+    assert r.status_code == 200 and body["status"] == "SUCCESS" and body["check_id"]
+    row = fake_db.store["compliance_checks"][0]
+    assert row["status"] == "pending_review" and row["jurisdiction"] == "UK"
+    assert row["citations"] and row["agent_log"]
+
+
+def test_input_validation(client):
+    assert client.post("/compliance/check", json={"query": "x"}).status_code == 422          # too short
+    assert client.post("/compliance/check", json={"query": "valid query", "jurisdiction": "FR"}).status_code == 422
+    assert client.post("/compliance/check", json={"query": "q" * 2001}).status_code == 422
+
+
+def test_matter_ref_links_to_matter(client, fake_db):
+    fake_db.store["matters"] = [{"id": "m-1", "matter_ref": "KEJ-ABC"}]
+    client.post("/compliance/check", json={"query": "director duties", "jurisdiction": "UK", "matter_ref": "KEJ-ABC"})
+    assert fake_db.store["compliance_checks"][0]["matter_id"] == "m-1"
+
+
+def test_retrieval_outage_is_503_not_500(fake_db):
+    def boom(q, jx): raise RuntimeError("db down")
+    app.dependency_overrides[deps.get_db] = lambda: fake_db
+    app.dependency_overrides[deps.get_agent] = lambda: ComplianceAgent(llm=FakeLLM(GOOD), retrieve=boom)
+    try:
+        r = TestClient(app).post("/compliance/check", json={"query": "director duties", "jurisdiction": "UK"})
+        assert r.status_code == 503
+    finally:
+        app.dependency_overrides.clear()
+
+
+# ── human-in-the-loop ────────────────────────────────────────────────────────
+def _make_check(client):
+    return client.post("/compliance/check", json={"query": "director duties", "jurisdiction": "UK"}).json()["check_id"]
+
+
+def test_approve_flow_and_double_review_blocked(client, fake_db):
+    cid = _make_check(client)
+    assert client.get(f"/compliance/{cid}/status").json()["status"] == "pending_review"
+    assert client.get("/review/pending").json()["count"] == 1
+
+    r = client.put(f"/compliance/{cid}/approve", json={"validated_output": "edited by lawyer", "reviewer_note": "ok"})
+    assert r.status_code == 200
+    row = fake_db.store["compliance_checks"][0]
+    assert row["status"] == "approved" and row["validated_output"] == "edited by lawyer" and row["reviewed_at"]
+    assert client.put(f"/compliance/{cid}/reject", json={}).status_code == 409        # already reviewed
+    assert client.get("/review/pending").json()["count"] == 0
+
+
+def test_reject(client, fake_db):
+    cid = _make_check(client)
+    assert client.put(f"/compliance/{cid}/reject", json={"reviewer_note": "wrong statute"}).status_code == 200
+    assert fake_db.store["compliance_checks"][0]["status"] == "rejected"
+
+
+def test_bad_uuid_rejected(client):
+    assert client.get("/compliance/not-a-uuid/status").status_code == 400
+
+
+# ── production security ─────────────────────────────────────────────────────
+@pytest.fixture
+def prod(monkeypatch):
+    monkeypatch.setenv("KEJI_ENV", "production")
+    monkeypatch.setenv("KEJI_API_SECRET", "a" * 40)
+    monkeypatch.setenv("KEJI_REVIEWER_SECRET", "b" * 40)
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "k")
+
+
+def test_production_requires_bearer_token(client, prod):
+    body = {"query": "director duties", "jurisdiction": "UK"}
+    assert client.post("/compliance/check", json=body).status_code == 401
+    assert client.post("/compliance/check", json=body, headers={"Authorization": "Bearer wrong"}).status_code == 401
+    ok = client.post("/compliance/check", json=body, headers={"Authorization": "Bearer " + "a" * 40})
+    assert ok.status_code == 200
+
+
+def test_production_review_needs_second_key(client, prod):
+    h = {"Authorization": "Bearer " + "a" * 40}
+    cid = client.post("/compliance/check", json={"query": "director duties", "jurisdiction": "UK"}, headers=h).json()["check_id"]
+    assert client.put(f"/compliance/{cid}/approve", json={}, headers=h).status_code == 403            # API token alone ≠ reviewer
+    assert client.put(f"/compliance/{cid}/approve", json={}, headers={**h, "X-Reviewer-Key": "wrong"}).status_code == 403
+    assert client.put(f"/compliance/{cid}/approve", json={}, headers={**h, "X-Reviewer-Key": "b" * 40}).status_code == 200
+    assert client.get("/review/pending", headers=h).status_code == 403                                # content is reviewer-only
+
+
+@pytest.mark.parametrize("env,expect_fail", [
+    ({"KEJI_API_SECRET": "short", "KEJI_REVIEWER_SECRET": "b" * 40}, True),
+    ({"KEJI_API_SECRET": "change-me-in-production", "KEJI_REVIEWER_SECRET": "b" * 40}, True),
+    ({"KEJI_API_SECRET": "a" * 40, "KEJI_REVIEWER_SECRET": ""}, True),
+    ({"KEJI_API_SECRET": "a" * 40, "KEJI_REVIEWER_SECRET": "a" * 40}, True),   # must differ
+    ({"KEJI_API_SECRET": "a" * 40, "KEJI_REVIEWER_SECRET": "b" * 40}, False),
+])
+def test_production_config_guard(monkeypatch, env, expect_fail):
+    monkeypatch.setenv("KEJI_ENV", "production")
+    monkeypatch.setenv("SUPABASE_URL", "u"); monkeypatch.setenv("SUPABASE_SERVICE_KEY", "k")
+    for k, v in env.items(): monkeypatch.setenv(k, v)
+    if expect_fail:
+        with pytest.raises(RuntimeError):
+            auth.check_production_config()
+    else:
+        auth.check_production_config()
+
+
+def test_app_refuses_to_boot_with_weak_prod_config(monkeypatch):
+    monkeypatch.setenv("KEJI_ENV", "production")
+    monkeypatch.setenv("KEJI_API_SECRET", "weak")
+    with pytest.raises(RuntimeError):
+        with TestClient(app):   # entering the context runs the lifespan startup
+            pass
+
+
+def test_dev_mode_open_for_local_work(client, monkeypatch):
+    monkeypatch.setenv("KEJI_ENV", "development")
+    assert client.post("/jurisdiction/classify", json={"text": "GDPR"}).status_code == 200
+
+
+# ── contracts ───────────────────────────────────────────────────────────────
+def test_contract_flags_and_tolerance(client, fake_db):
+    clause = "The Supplier shall indemnify and hold harmless the Customer. This Agreement is governed by the laws of England."
+    base = {"clause": clause, "agreement_type": "MSA", "jurisdiction": "UK", "focus_areas": ["Liability & Indemnity"]}
+    std = client.post("/contracts/analyze", json=base).json()
+    assert std["risk_level"] == "High" and any(f["title"].startswith("Indemnity") for f in std["flags"])
+    assert std["review_status"] == "pending_review" and std["related_provisions"] and std["check_id"]
+    assert fake_db.store["compliance_checks"][0]["check_type"] == "contract"
+
+    renew = {"clause": "This Agreement shall automatically renew for successive one year terms.",
+             "agreement_type": "MSA", "jurisdiction": "UK", "focus_areas": ["Termination & Renewal"]}
+    level = lambda tol: client.post("/contracts/analyze", json={**renew, "risk_tolerance": tol}).json()["risk_level"]
+    assert (level("Aggressive"), level("Standard"), level("Conservative (Strict)")) == ("Low", "Medium", "High")
+
+
+def test_contract_missing_governing_law_flagged(client):
+    r = client.post("/contracts/analyze", json={"clause": "The parties agree to cooperate in good faith always.",
+                                                "jurisdiction": "UK", "focus_areas": ["Governing Law & Dispute"]}).json()
+    assert any("No governing law" in f["title"] for f in r["flags"])
+
+
+def test_contract_unknown_focus_area_400(client):
+    r = client.post("/contracts/analyze", json={"clause": "x" * 20, "focus_areas": ["Astrology"]})
+    assert r.status_code == 400
+
+
+def test_contract_survives_retrieval_failure(client, monkeypatch):
+    from api.rag import retriever
+    monkeypatch.setattr(retriever, "retrieve", lambda q, jx: (_ for _ in ()).throw(RuntimeError("down")))
+    r = client.post("/contracts/analyze", json={"clause": "Neither party is liable for indirect damages.", "jurisdiction": "UK"})
+    assert r.status_code == 200 and r.json()["related_provisions"] == []

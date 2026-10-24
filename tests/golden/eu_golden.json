@@ -1,0 +1,15 @@
+{
+  "version": "1.0",
+  "jurisdiction": "EU",
+  "queries": [
+    {"id": "EU-001", "query": "What principles govern the processing of personal data?",
+     "expected_statute": "General Data Protection Regulation", "expected_section_keyword": "personal data",
+     "ground_truth": "Personal data shall be processed lawfully, fairly and in a transparent manner."},
+    {"id": "EU-002", "query": "What is the right to erasure of personal data?",
+     "expected_statute": "General Data Protection Regulation", "expected_section_keyword": "erasure",
+     "ground_truth": "The data subject shall have the right to obtain the erasure of personal data concerning him or her without undue delay."},
+    {"id": "EU-003", "query": "When must a personal data breach be notified to the supervisory authority?",
+     "expected_statute": "General Data Protection Regulation", "expected_section_keyword": "breach",
+     "ground_truth": "The controller shall notify the personal data breach to the supervisory authority not later than 72 hours after having become aware of it."}
+  ]
+}

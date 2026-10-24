@@ -1,0 +1,6 @@
+-r requirements-api.txt
+-r requirements.txt
+pytest==8.3.3
+# Optional, heavy — only if you later add RAGAS evaluation:
+# ragas==0.2.0
+# datasets==3.0.0

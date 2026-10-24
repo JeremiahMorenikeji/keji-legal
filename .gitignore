@@ -1,0 +1,36 @@
+# Secrets — never commit
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Downloaded legal text — too large for git
+corpus/statutes/**/*.pdf
+corpus/statutes/**/*.xml
+corpus/statutes/**/*.html
+corpus/statutes/**/*.xhtml
+corpus/statutes/**/*.json
+
+# IDE / OS
+.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test outputs
+.pytest_cache/
+htmlcov/
+.coverage
+
+.env

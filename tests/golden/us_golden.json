@@ -1,0 +1,9 @@
+{
+  "version": "1.0",
+  "jurisdiction": "US",
+  "queries": [
+    {"id": "US-001", "query": "What are the rules on deceptive advertising and unfair trade practices?",
+     "expected_statute": "Title 16", "expected_section_keyword": "deceptive",
+     "ground_truth": "Federal Trade Commission rules addressing unfair or deceptive acts or practices."}
+  ]
+}

@@ -1,0 +1,110 @@
+"""
+Per-section parsers (guide fix 13). Pure functions: bytes/str in, sections out — easy to unit-test.
+Each returns a list of (section_ref, text).
+"""
+import re
+import warnings
+
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+# EU files are XHTML; the HTML parser handles them fine, so silence the notice.
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+MIN_SECTION_CHARS = 30
+
+
+def _ref_from_clml_id(raw_id: str, number: str) -> str:
+    """'section-172' → 'Section 172';  'schedule-1-paragraph-3' → 'Schedule 1 paragraph 3'."""
+    if raw_id.startswith("section-"):
+        return "Section " + raw_id[len("section-"):].replace("-", " ").strip()
+    if raw_id.startswith("article-"):
+        return "Article " + raw_id[len("article-"):].replace("-", " ").strip()
+    if raw_id:
+        human = raw_id.replace("-", " ").strip()
+        return human[0].upper() + human[1:]
+    return f"Section {number}" if number else ""
+
+
+def parse_clml(xml: bytes) -> list[tuple[str, str]]:
+    """
+    legislation.gov.uk CLML. Each provision is a <P1> (id='section-172') holding a
+    <Pnumber>; the heading is the <Title> of its parent <P1group>.
+    """
+    soup = BeautifulSoup(xml, "lxml-xml")
+    for junk in soup.find_all(["Commentary", "Footnote", "CommentaryRef", "FootnoteRef"]):
+        junk.decompose()
+
+    out = []
+    for p1 in soup.find_all("P1"):
+        number_tag = p1.find("Pnumber")
+        number = number_tag.get_text(strip=True) if number_tag else ""
+        ref = _ref_from_clml_id(p1.get("id", ""), number)
+        group = p1.find_parent("P1group")
+        title = group.find("Title").get_text(" ", strip=True) if group and group.find("Title") else ""
+        text = p1.get_text(" ", strip=True)
+        if len(text) < MIN_SECTION_CHARS or not ref:
+            continue
+        out.append((ref, f"{title}. {text}" if title else text))
+
+    if not out:  # unfamiliar structure → still ingest, just without section granularity
+        full = soup.get_text(" ", strip=True)
+        out = [("full_text", full)] if full else []
+    return out
+
+
+def parse_justice_laws(xml: bytes) -> list[tuple[str, str]]:
+    """
+    Canada Justice Laws XML. <Section> holds <Label> (the number), <MarginalNote>
+    (the heading), and the provision text in <Text>/<Subsection>.
+    """
+    soup = BeautifulSoup(xml, "lxml-xml")
+    out = []
+    for sec in soup.find_all("Section"):
+        label = sec.find("Label", recursive=False)
+        ref = f"Section {label.get_text(strip=True)}" if label else (sec.get("id") or "")
+        note = sec.find("MarginalNote", recursive=False)
+        title = note.get_text(" ", strip=True) if note else ""
+        # drop the section's own number + heading from the body (kept in ref/title);
+        # subsection labels like "(2)" stay because they are part of the text.
+        if label:
+            label.decompose()
+        if note:
+            note.decompose()
+        body = sec.get_text(" ", strip=True)
+        if len(body) < MIN_SECTION_CHARS or not ref:
+            continue
+        out.append((ref, f"{title}. {body}" if title else body))
+
+    if not out:
+        full = soup.get_text(" ", strip=True)
+        out = [("full_text", full)] if full else []
+    return out
+
+
+_ARTICLE_LINE = re.compile(r"^\s*Article\s+(\d+[a-z]?)\s*$", re.M)
+
+
+def parse_eu_html(html: str) -> list[tuple[str, str]]:
+    """
+    EU legislation XHTML. Preferred: elements id='art_5' (one per article).
+    Fallback: split plain text on lines that read exactly 'Article N'.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    out = []
+    for el in soup.find_all(id=re.compile(r"^art_\d+[a-z]?$")):
+        text = el.get_text(" ", strip=True)
+        if len(text) >= MIN_SECTION_CHARS:
+            out.append((f"Article {el['id'][4:]}", text))
+    if out:
+        return out
+
+    text = soup.get_text("\n", strip=True)
+    marks = list(_ARTICLE_LINE.finditer(text))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        body = text[m.end():end].strip()
+        if len(body) >= MIN_SECTION_CHARS:
+            out.append((f"Article {m.group(1)}", body))
+    if out:
+        return out
+    return [("full_text", text)] if text else []

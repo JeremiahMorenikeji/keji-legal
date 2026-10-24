@@ -1,0 +1,98 @@
+"""Drives the real Streamlit pages headlessly (streamlit.testing.AppTest) with the API faked."""
+import pytest
+from streamlit.testing.v1 import AppTest
+
+GOOD = {"status": "SUCCESS", "check_id": "11111111-1111-4111-8111-111111111111",
+        "validated_output": "• [CHUNK-ID: aaaaaaaa] Companies Act 2006, Section 172",
+        "hallucinated_ids": ["deadbeef"], "unverified_quotes": ["made up words here"],
+        "citations": [{"id": "aaaaaaaa-0", "rrf_rank": 1, "statute_name": "Companies Act 2006",
+                       "section": "Section 172", "jurisdiction": "UK", "content": "A director must act <script>alert(1)</script>"}]}
+
+
+class R:
+    def __init__(self, code, js): self.status_code, self._js, self.text = code, js, ""
+    def json(self): return self._js
+
+
+@pytest.fixture
+def fake_api(monkeypatch):
+    import requests
+    calls = []
+    def request(method, url, json=None, headers=None, timeout=None):
+        calls.append((method, url, json, headers))
+        if url.endswith("/compliance/check"): return R(200, GOOD)
+        if url.endswith("/jurisdiction/classify"): return R(200, {"suggestion": "EU"})
+        if url.endswith("/contracts/analyze"):
+            return R(200, {"risk_level": "High", "summary": "s", "check_id": "c", "disclaimer": "d",
+                           "flags": [{"focus": "Liability & Indemnity", "title": "Indemnity obligation present",
+                                      "detail": "check it", "severity": "High", "excerpt": "indemnify"}],
+                           "related_provisions": []})
+        if url.endswith("/review/pending"):
+            return R(200, {"count": 1, "items": [{"id": "abc", "query": "q?", "check_type": "compliance",
+                           "jurisdiction": "UK", "validated_output": "text", "citations": []}]})
+        return R(200, {"status": "approved"})
+    monkeypatch.setattr(requests, "request", request)
+    monkeypatch.setattr(requests, "get", lambda *a, **k: R(200, {}))
+    return calls
+
+
+def test_dashboard_loads(fake_api):
+    at = AppTest.from_file("app/main.py", default_timeout=20).run()
+    assert not at.exception
+    assert at.metric[0].value.endswith("US")            # default jurisdiction
+    assert at.metric[2].value == "v0.1.0"
+
+
+def test_compliance_search_flow(fake_api, monkeypatch):
+    monkeypatch.setenv("KEJI_API_SECRET", "s3cret")
+    at = AppTest.from_file("app/pages/02_compliance.py", default_timeout=20).run()
+    at.selectbox(key="jurisdiction_label").select("🇬🇧 United Kingdom (UK)").run()
+    at.text_area[0].set_value("What are a director's duties?").run()
+    at.button[0].click().run()
+    assert not at.exception
+    method, url, body, headers = next(c for c in fake_api if c[1].endswith("/compliance/check"))
+    assert body["jurisdiction"] == "UK"                                   # sidebar choice is what's sent
+    assert headers["Authorization"] == "Bearer s3cret"                   # secret sent server-side
+    out = [t for t in at.text_area if t.label.startswith("Agent output")][0]
+    assert "Companies Act 2006" in out.value and out.disabled
+    warnings = " ".join(w.value for w in at.warning)
+    assert "citation(s) removed" in warnings and "word-for-word" in warnings
+    assert "EU" in " ".join(i.value for i in at.info)                    # router SUGGESTS, never overrides
+    assert not any(m.value for m in at.markdown if "<script>" in str(m.value))   # raw HTML never rendered
+
+
+def test_compliance_empty_query_does_not_call_api(fake_api):
+    at = AppTest.from_file("app/pages/02_compliance.py", default_timeout=20).run()
+    at.button[0].click().run()
+    assert at.warning and not any(c[1].endswith("/compliance/check") for c in fake_api)
+
+
+def test_compliance_api_offline_message(monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.exceptions.ConnectionError()))
+    monkeypatch.setattr(requests, "request", lambda *a, **k: (_ for _ in ()).throw(requests.exceptions.ConnectionError()))
+    at = AppTest.from_file("app/pages/02_compliance.py", default_timeout=20).run()
+    at.text_area[0].set_value("director duties").run()
+    at.button[0].click().run()
+    assert not at.exception and any("uvicorn api.main:app" in e.value for e in at.error)
+
+
+def test_contract_page(fake_api):
+    at = AppTest.from_file("app/pages/03_contracts.py", default_timeout=20).run()
+    at.text_area[0].set_value("The Supplier shall indemnify the Customer against all claims.").run()
+    at.button[0].click().run()
+    assert not at.exception
+    body = next(c[2] for c in fake_api if c[1].endswith("/contracts/analyze"))
+    assert body["focus_areas"] == ["Liability & Indemnity"] and body["risk_tolerance"] == "Standard"
+    assert any("Highest flag: High" in m.value for m in at.markdown)
+
+
+def test_review_page_sends_reviewer_key_and_approves(fake_api):
+    at = AppTest.from_file("app/pages/05_review.py", default_timeout=20).run()
+    at.text_input(key="reviewer_key").set_value("rk-123").run()
+    at.button[0].click().run()                                            # Load pending items
+    assert not at.exception and len(at.expander) == 1
+    approve = [b for b in at.button if b.label == "Approve"][0]
+    approve.click().run()
+    put = next(c for c in fake_api if c[0] == "PUT")
+    assert put[1].endswith("/compliance/abc/approve") and put[3]["X-Reviewer-Key"] == "rk-123"

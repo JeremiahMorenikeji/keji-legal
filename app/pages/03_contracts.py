@@ -1,0 +1,69 @@
+"""Contract clause triage — pattern-based flags + related statutes. Not legal advice."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import streamlit as st  # noqa: E402
+from components import shared  # noqa: E402
+
+shared.setup("Contract Review", "📄")
+jurisdiction = shared.sidebar()
+
+FOCUS = ["Liability & Indemnity", "Intellectual Property", "Termination & Renewal", "Governing Law & Dispute"]
+AGREEMENTS = ["Master Services Agreement (MSA)", "Software as a Service (SaaS)", "Non-Disclosure Agreement (NDA)",
+              "Employment Contract", "Vendor Agreement"]
+ICON = {"High": "🔴", "Medium": "🟠", "Low": "🟢"}
+
+st.title("📄 Contract Review & Clause Analyzer")
+st.caption(f"Jurisdiction: {shared.FLAGS[jurisdiction]} **{jurisdiction}** · Triage aid only — not legal advice.")
+
+doc = shared.document_panel("contracts")
+left, right = st.columns([2, 1])
+with left:
+    agreement = st.selectbox("Agreement type", AGREEMENTS)
+    use_doc = bool(doc) and st.radio("What should be analysed?", ["The uploaded document", "The text I paste below"],
+                                     horizontal=True) == "The uploaded document"
+    clause = st.text_area("Paste a clause or section", height=200, max_chars=40000,
+                          placeholder="e.g. Neither party shall be liable for any indirect or consequential damages…")
+with right:
+    tolerance = st.selectbox("Risk tolerance", ["Standard", "Conservative (Strict)", "Aggressive"])
+    focus = st.multiselect("Primary risk focus", FOCUS, default=FOCUS)
+
+if st.button("Evaluate clause", type="primary", use_container_width=True):
+    text = doc["text"] if use_doc else clause.strip()
+    if len(text) < 10:
+        st.warning("Please paste at least a full sentence of contract text, or upload a document.")
+    elif not focus:
+        st.warning("Choose at least one risk focus.")
+    else:
+        with st.spinner("Analysing…"):
+            data, err = shared.api_call("POST", "/contracts/analyze", json={
+                "clause": text, "agreement_type": agreement, "jurisdiction": jurisdiction,
+                **({"document_name": doc["name"]} if use_doc else {}),
+                "risk_tolerance": tolerance, "focus_areas": focus})
+        st.session_state["contract_result"] = {"data": data, "err": err}
+
+res = st.session_state.get("contract_result")
+if res:
+    if res["err"]:
+        st.error(res["err"])
+    else:
+        d = res["data"]
+        st.markdown(f"### {ICON.get(d['risk_level'], '')} Highest flag: {d['risk_level']}")
+        st.write(d["summary"])
+        st.markdown("### Points for attention")
+        if not d["flags"]:
+            st.info("No pattern-based flags were raised. That does not mean the clause is safe.")
+        for f in d["flags"]:
+            with st.expander(f"{ICON[f['severity']]} {f['severity']} — {f['title']} ({f['focus']})"):
+                st.write(f["detail"])
+                if f["excerpt"]:
+                    st.text(f["excerpt"])
+        st.markdown("### Closest statutes in the corpus (matches can be loose - check they are relevant)")
+        if not d["related_provisions"]:
+            st.caption("None retrieved (the corpus may not be loaded for this jurisdiction yet).")
+        for p in d["related_provisions"]:
+            with st.expander(f"{p['statute_name']} [{p['section']}]"):
+                st.text(p["excerpt"])
+        st.caption(f"Check ID `{d.get('check_id')}` · {d['disclaimer']}")

@@ -1,0 +1,36 @@
+"""KEJI Legal — dashboard. Run with:  streamlit run app/main.py"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # lets pages import `components.*`
+
+import streamlit as st  # noqa: E402
+from components import shared  # noqa: E402
+
+shared.setup("Dashboard")
+code = shared.sidebar()
+
+st.markdown(
+    """
+<div style='text-align:center;padding:20px 0 12px'>
+  <div style='font-size:48px;color:#E2E2E2;font-weight:900;letter-spacing:.15em'>K <span style='color:#C9A84C'>⚖</span> G</div>
+  <div style='font-size:10px;letter-spacing:.4em;color:#C9A84C;text-transform:uppercase'>KEJI LEGAL · RESEARCH ASSISTANT</div>
+  <div style='font-size:11px;color:rgba(226,226,226,0.3);font-style:italic;margin-top:4px'>The law, wherever you are.</div>
+</div><hr style='border-color:rgba(201,168,76,0.18);margin:0 0 20px'>""",
+    unsafe_allow_html=True,  # static content only
+)
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Active Jurisdiction", f"{shared.FLAGS[code]} {code}")
+c2.metric("API Status", "Live" if shared._api_online(shared.API_BASE) else "Offline")
+c3.metric("Build", "v0.1.0")
+st.divider()
+
+st.markdown("### Workflows")
+st.markdown(
+    "- **Compliance Research** — ask a question; get cited statutory provisions.\n"
+    "- **Contract Review** — paste a clause; get triage flags plus related statutes.\n"
+    "- **Review Queue** — for approved reviewers: approve or reject pending outputs."
+)
+st.info("Pick a workflow from the sidebar menu to begin.")
+st.caption(shared.DISCLAIMER)
