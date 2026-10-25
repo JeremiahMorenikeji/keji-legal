@@ -1,0 +1,140 @@
+"""Shared fixtures. Offline tests never touch the network, Supabase, or a real LLM."""
+import os
+import sys
+import uuid
+import zlib
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Offline tests must NEVER depend on a developer's real .env. (For example, a KEJI_REVIEWER_SECRET in
+# .env makes the review endpoints demand that key, which would turn the tests' calls into 403s.)
+import dotenv  # noqa: E402
+
+if os.getenv("KEJI_LIVE") != "1":
+    dotenv.load_dotenv = lambda *a, **k: False  # modules imported later get this harmless no-op
+os.environ["KEJI_ENV"] = "development"
+os.environ.setdefault("RAG_TOP_K", "5")
+
+
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    """Start every test with no KEJI secrets, whatever is in .env or your shell."""
+    for var in ("KEJI_API_SECRET", "KEJI_REVIEWER_SECRET", "KEJI_API_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("KEJI_ENV", "development")
+
+
+def pytest_collection_modifyitems(config, items):
+    if os.getenv("KEJI_LIVE") == "1":
+        return
+    skip = pytest.mark.skip(reason="live test: set KEJI_LIVE=1 and fill in .env")
+    for item in items:
+        if "live" in item.keywords:
+            item.add_marker(skip)
+
+
+# ── fake embedding model (hashed bag-of-words → 384 dims, normalised) ────────
+class FakeTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        return text.split()
+
+
+class FakeModel:
+    tokenizer = FakeTokenizer()
+
+    @staticmethod
+    def _vec(text):
+        v = np.zeros(384)
+        for w in text.lower().split():
+            v[zlib.crc32(w.encode()) % 384] += 1.0
+        n = np.linalg.norm(v)
+        return v / n if n else v
+
+    def encode(self, texts, normalize_embeddings=True, **kw):
+        if isinstance(texts, str):
+            return self._vec(texts)
+        return np.array([self._vec(t) for t in texts])
+
+
+@pytest.fixture(autouse=True)
+def fake_embedder(monkeypatch):
+    from api.rag import embedder
+    embedder._model.cache_clear()
+    monkeypatch.setattr(embedder, "_model", lambda: FakeModel())
+    # routing agent caches anchor vectors — reset between tests
+    from api.agents import routing_agent
+    monkeypatch.setattr(routing_agent, "_anchor_cache", None)
+
+
+# ── in-memory fake of the supabase-py table API ──────────────────────────────
+class _Result:
+    def __init__(self, data):
+        self.data = data
+
+
+class _Query:
+    def __init__(self, store, name):
+        self.store, self.name = store, name
+        self.op, self.payload, self.filters, self.cols = "select", None, [], "*"
+        self._order, self._limit, self.conflict = None, None, None
+
+    def select(self, cols="*"): self.op, self.cols = "select", cols; return self
+    def insert(self, row): self.op, self.payload = "insert", row; return self
+    def upsert(self, rows, on_conflict="", ignore_duplicates=False, **kw):
+        self.op, self.payload, self.conflict = "upsert", rows, on_conflict; return self
+    def update(self, row): self.op, self.payload = "update", row; return self
+    def eq(self, k, v): self.filters.append((k, v)); return self
+    def order(self, k, desc=False): self._order = (k, desc); return self
+    def limit(self, n): self._limit = n; return self
+
+    def _match(self, r): return all(r.get(k) == v for k, v in self.filters)
+
+    def execute(self):
+        rows = self.store.setdefault(self.name, [])
+        if self.op == "insert":
+            new = dict(self.payload); new.setdefault("id", str(uuid.uuid4()))
+            new.setdefault("created_at", "2026-01-01T00:00:00Z")
+            rows.append(new); return _Result([new])
+        if self.op == "upsert":
+            keys = self.conflict.split(",") if self.conflict else []
+            added = []
+            for p in self.payload:
+                sig = tuple(p.get(k) if k != "content_hash" else p["content"] for k in keys)
+                if any(tuple(r.get(k) if k != "content_hash" else r["content"] for k in keys) == sig for r in rows):
+                    continue
+                new = dict(p); new["id"] = str(uuid.uuid4()); rows.append(new); added.append(new)
+            return _Result(added)
+        if self.op == "update":
+            hit = [r for r in rows if self._match(r)]
+            for r in hit: r.update(self.payload)
+            return _Result(hit)
+        hit = [r for r in rows if self._match(r)]
+        if self._order:
+            hit.sort(key=lambda r: r.get(self._order[0], ""), reverse=self._order[1])
+        return _Result(hit[: self._limit] if self._limit else hit)
+
+
+class FakeDB:
+    def __init__(self): self.store = {}
+    def table(self, name): return _Query(self.store, name)
+
+
+@pytest.fixture
+def fake_db():
+    return FakeDB()
+
+
+def make_chunk(i, statute="Companies Act 2006", section="Section 172", jx="UK",
+               content="A director of a company must act in the way he considers would promote the success of the company."):
+    return {"id": f"{i:08x}-0000-4000-8000-000000000000", "statute_name": statute, "section": section,
+            "jurisdiction": jx, "year": 2006, "content": content, "metadata": {}}
+
+
+class FakeLLM:
+    def __init__(self, reply): self.reply, self.calls = reply, []
+    def complete(self, system, messages, max_tokens=1200):
+        self.calls.append((system, messages)); return self.reply

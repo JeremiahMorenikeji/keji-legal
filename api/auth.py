@@ -8,12 +8,32 @@ from fastapi import Header, HTTPException
 DEFAULT_SECRETS = {"", "change-me-in-production", "generate_a_long_random_string_here"}
 
 
-def env_name() -> str:
-    return os.getenv("KEJI_ENV", "development").lower()
+# Railway sets these on every deployment (see docs.railway.com/variables/reference)
+_RAILWAY_VARS = ("RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT_NAME", "RAILWAY_SERVICE_ID", "RAILWAY_PUBLIC_DOMAIN")
+
+
+def _clean(name: str) -> str:
+    """Environment variable, lower-cased, with stray spaces and quotes ignored."""
+    return os.getenv(name, "").strip().strip("\"'").strip().lower()
+
+
+def on_railway() -> bool:
+    return any(os.getenv(v) for v in _RAILWAY_VARS)
 
 
 def is_production() -> bool:
-    return env_name() == "production"
+    """
+    Production when KEJI_ENV says so - and, failing closed, ALWAYS when running on Railway, so a forgotten or
+    mistyped KEJI_ENV can never leave a public server open. (A deliberate staging server can set
+    KEJI_ALLOW_INSECURE=true.)
+    """
+    if _clean("KEJI_ENV") in ("production", "prod"):
+        return True
+    return on_railway() and _clean("KEJI_ALLOW_INSECURE") not in ("1", "true", "yes")
+
+
+def env_name() -> str:
+    return "production" if is_production() else "development"
 
 
 def check_production_config() -> None:

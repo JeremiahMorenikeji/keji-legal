@@ -23,7 +23,8 @@ os.environ.setdefault("RAG_TOP_K", "5")
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     """Start every test with no KEJI secrets, whatever is in .env or your shell."""
-    for var in ("KEJI_API_SECRET", "KEJI_REVIEWER_SECRET", "KEJI_API_BASE_URL"):
+    for var in ("KEJI_API_SECRET", "KEJI_REVIEWER_SECRET", "KEJI_API_BASE_URL", "KEJI_ALLOW_INSECURE",
+                "RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT_NAME", "RAILWAY_SERVICE_ID", "RAILWAY_PUBLIC_DOMAIN"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("KEJI_ENV", "development")
 

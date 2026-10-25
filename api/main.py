@@ -16,6 +16,7 @@ VERSION = "0.1.0"
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    print(f"[keji] starting in {'PRODUCTION' if is_production() else 'DEVELOPMENT'} mode", flush=True)
     check_production_config()  # crash early (and loudly) on unsafe production config
     yield
 
@@ -57,7 +58,8 @@ app.include_router(matters.router)
 @app.get("/health")
 def health():
     """Unauthenticated, cheap, never touches the DB or the model (used by Railway's health check)."""
-    return {"status": "ok", "service": "KEJI Legal API", "version": VERSION}
+    return {"status": "ok", "service": "KEJI Legal API", "version": VERSION,
+            "mode": "production" if is_production() else "development"}
 
 
 @app.get("/", include_in_schema=False)
