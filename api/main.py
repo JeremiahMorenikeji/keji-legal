@@ -25,6 +25,9 @@ app = FastAPI(
     description="Legal research assistant · US · CA · UK · EU",
     version=VERSION,
     lifespan=lifespan,
+    docs_url=None if is_production() else "/docs",     # no public API docs in production
+    redoc_url=None,
+    openapi_url=None if is_production() else "/openapi.json",
 )
 
 
@@ -55,3 +58,9 @@ app.include_router(matters.router)
 def health():
     """Unauthenticated, cheap, never touches the DB or the model (used by Railway's health check)."""
     return {"status": "ok", "service": "KEJI Legal API", "version": VERSION}
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    """So that opening the bare address in a browser shows a sign of life instead of 'Not Found'."""
+    return {"service": "KEJI Legal API", "status": "running", "version": VERSION, "health": "/health"}
